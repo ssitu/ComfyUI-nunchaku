@@ -11,7 +11,7 @@ from comfy import model_detection, model_management
 from nunchaku.utils import check_hardware_compatibility, get_precision_from_quantization_config
 
 from ...model_configs.zimage import NunchakuZImage
-from ...model_patcher import NunchakuModelPatcher
+from comfy.model_patcher import ModelPatcher
 from ...wrappers.zimage import ComfyZImageWrapper
 from ..utils import get_filename_list, get_full_path_or_raise
 
@@ -165,10 +165,11 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
             "model_config": model_config,
             "device": load_device,
             "device_id": device_id,
+            "offload_device": offload_device,
         },
     )
 
-    return NunchakuModelPatcher(model, load_device=load_device, offload_device=offload_device)
+    return ModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
 
 class NunchakuZImageDiTLoader:

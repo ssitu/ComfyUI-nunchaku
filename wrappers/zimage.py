@@ -71,10 +71,12 @@ class _LoRALinear(nn.Module):
     during the forward pass without modifying the original weights permanently.
     """
 
+    _LORA_A_BUF = "_nunchaku_lora_A"
+    _LORA_B_BUF = "_nunchaku_lora_B"
+
     def __init__(self, base: nn.Linear):
         super().__init__()
         self.base = base
-        self.loras: List[Tuple[torch.Tensor, torch.Tensor]] = []  # (A, B) where delta = (x @ A.T) @ B.T
 
     @property
     def in_features(self) -> int:
@@ -92,18 +94,51 @@ class _LoRALinear(nn.Module):
     def bias(self) -> Optional[torch.Tensor]:
         return self.base.bias
 
+    @staticmethod
+    def _register_or_set_buffer(module: nn.Module, name: str, tensor: torch.Tensor) -> None:
+        if name in module._buffers:
+            module._buffers[name] = tensor
+            return
+        # `persistent=False` avoids polluting state_dict; fallback for older torch.
+        try:
+            module.register_buffer(name, tensor, persistent=False)
+        except TypeError:
+            module.register_buffer(name, tensor)
+
+    def set_loras(self, loras: List[Tuple[torch.Tensor, torch.Tensor]]) -> None:
+        if not loras:
+            self.clear_loras()
+            return
+
+        A_cat = torch.cat([A for A, _ in loras], dim=0)
+        B_cat = torch.cat([B for _, B in loras], dim=1)
+
+        device = self.base.weight.device
+        dtype = self.base.weight.dtype
+        A_cat = A_cat.to(device=device, dtype=dtype)
+        B_cat = B_cat.to(device=device, dtype=dtype)
+
+        # Store as buffers on the leaf `nn.Linear` so ComfyUI's ModelPatcher `.to()` calls move them in lowvram mode.
+        self._register_or_set_buffer(self.base, self._LORA_A_BUF, A_cat)
+        self._register_or_set_buffer(self.base, self._LORA_B_BUF, B_cat)
+
+    def clear_loras(self) -> None:
+        self.base._buffers.pop(self._LORA_A_BUF, None)
+        self.base._buffers.pop(self._LORA_B_BUF, None)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
-        if not self.loras:
+
+        A = self.base._buffers.get(self._LORA_A_BUF, None)
+        B = self.base._buffers.get(self._LORA_B_BUF, None)
+        if A is None or B is None:
             return out
 
-        x_in = x
-        for A, B in self.loras:
-            # Cast LoRA weights to match input dtype/device dynamically
-            A = A.to(device=x_in.device, dtype=x_in.dtype)
-            B = B.to(device=x_in.device, dtype=x_in.dtype)
-            out = out + (x_in @ A.transpose(0, 1)) @ B.transpose(0, 1)
-        return out
+        if A.device != x.device or A.dtype != x.dtype:
+            A = A.to(device=x.device, dtype=x.dtype)
+            B = B.to(device=x.device, dtype=x.dtype)
+
+        return out + (x @ A.transpose(0, 1)) @ B.transpose(0, 1)
 
 
 def _get_module_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
@@ -311,9 +346,8 @@ def _apply_lora_to_linear(model: nn.Module, module_name: str, loras: List[Tuple[
     else:
         return False
 
-    device = wrapper.weight.device
-    dtype = wrapper.weight.dtype
-    wrapper.loras = [(A.to(device=device, dtype=dtype), B.to(device=device, dtype=dtype)) for A, B in loras]
+    wrapper.set_loras(loras)
+
     return True
 
 
@@ -323,6 +357,9 @@ def reset_lora(model: nn.Module) -> None:
     lora_linear_slots = getattr(model, "_lora_linear_slots", None)
     if lora_linear_slots:
         for module_name, orig_linear in list(lora_linear_slots.items()):
+            # Ensure any attached LoRA buffers are cleared before restoring.
+            orig_linear._buffers.pop(_LoRALinear._LORA_A_BUF, None)
+            orig_linear._buffers.pop(_LoRALinear._LORA_B_BUF, None)
             current = _get_module_by_name(model, module_name)
             if isinstance(current, _LoRALinear):
                 _set_module_by_name(model, module_name, orig_linear)
@@ -597,11 +634,20 @@ class ComfyZImageWrapper(nn.Module):
 
         return model(*args, **kwargs)
 
-    def to_safely(self, *args, **kwargs):
-        """Delegate to_safely to the underlying model to support NunchakuModelPatcher."""
+    def to(self, *args, **kwargs):
+        """Override to() to ensure safe offloading via to_safely check."""
         if hasattr(self.model, "to_safely"):
-            return self.model.to_safely(*args, **kwargs)
-        return self.model.to(*args, **kwargs)
+            self.model.to_safely(*args, **kwargs)
+            return self
+        return super().to(*args, **kwargs)
+
+    def to_safely(self, *args, **kwargs):
+        """Delegate to_safely to the underlying model to support ComfyUI offloading."""
+        if hasattr(self.model, "to_safely"):
+            self.model.to_safely(*args, **kwargs)
+            return self
+        self.model.to(*args, **kwargs)
+        return self
 
 
 def copy_with_ctx(model_wrapper: ComfyZImageWrapper) -> Tuple[ComfyZImageWrapper, ModelPatcher]:
@@ -623,6 +669,7 @@ def copy_with_ctx(model_wrapper: ComfyZImageWrapper) -> Tuple[ComfyZImageWrapper
 
     device = ctx_for_copy.get("device", torch.device("cpu"))
     device_id = ctx_for_copy.get("device_id", 0)
+    offload_device = ctx_for_copy.get("offload_device", torch.device("cpu"))
 
-    ret_model = ModelPatcher(model_base, device, device_id)
+    ret_model = ModelPatcher(model_base, load_device=device, offload_device=offload_device)
     return ret_model_wrapper, ret_model
