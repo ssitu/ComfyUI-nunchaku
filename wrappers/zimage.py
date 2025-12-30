@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from comfy.model_patcher import ModelPatcher
 from torch import nn
 
 from nunchaku.lora.flux.nunchaku_converter import (
@@ -30,6 +29,8 @@ from nunchaku.lora.flux.nunchaku_converter import (
 )
 from nunchaku.models.linear import SVDQW4A4Linear
 from nunchaku.utils import load_state_dict_in_safetensors
+from ..mixins.model import NunchakuModelMixin
+from ..model_patcher import NunchakuModelPatcher
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,13 @@ class _LoRALinear(nn.Module):
     @property
     def bias(self) -> Optional[torch.Tensor]:
         return self.base.bias
+
+    def _apply(self, fn):
+        """Override _apply to also apply to LoRA weights when model is moved."""
+        super()._apply(fn)
+        if self.loras:
+            self.loras = [(fn(A), fn(B)) for A, B in self.loras]
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
@@ -559,7 +567,7 @@ def compose_loras(model: nn.Module, lora_configs: List[Tuple[Union[str, Path], f
     return applied
 
 
-class ComfyZImageWrapper(nn.Module):
+class ComfyZImageWrapper(nn.Module, NunchakuModelMixin):
     """
     Wrapper for Z-Image transformer to support ComfyUI workflows and LoRA composition.
     """
@@ -598,7 +606,7 @@ class ComfyZImageWrapper(nn.Module):
         return model(*args, **kwargs)
 
 
-def copy_with_ctx(model_wrapper: ComfyZImageWrapper) -> Tuple[ComfyZImageWrapper, ModelPatcher]:
+def copy_with_ctx(model_wrapper: ComfyZImageWrapper) -> Tuple[ComfyZImageWrapper, NunchakuModelPatcher]:
     """Duplicates a ComfyZImageWrapper object with its initialization context."""
     ctx_for_copy = model_wrapper.ctx_for_copy
     ret_model_wrapper = ComfyZImageWrapper(
@@ -616,7 +624,7 @@ def copy_with_ctx(model_wrapper: ComfyZImageWrapper) -> Tuple[ComfyZImageWrapper
     model_base.diffusion_model = ret_model_wrapper
 
     device = ctx_for_copy.get("device", torch.device("cpu"))
-    device_id = ctx_for_copy.get("device_id", 0)
+    offload_device = ctx_for_copy.get("offload_device", torch.device("cpu"))
 
-    ret_model = ModelPatcher(model_base, device, device_id)
+    ret_model = NunchakuModelPatcher(model_base, load_device=device, offload_device=offload_device)
     return ret_model_wrapper, ret_model

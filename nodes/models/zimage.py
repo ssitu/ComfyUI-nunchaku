@@ -156,6 +156,8 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
     device_id = load_device.index if isinstance(load_device, torch.device) and load_device.type == "cuda" else 0
     if device_id is None:
         device_id = 0
+    if offload_device.type == "cpu":
+        device_id = "cpu"
 
     # Wrap in ComfyZImageWrapper for LoRA support
     model.diffusion_model = ComfyZImageWrapper(
