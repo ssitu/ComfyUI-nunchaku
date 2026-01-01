@@ -4,6 +4,7 @@ enabling integration with ComfyUI forward,
 LoRA composition, and advanced caching strategies.
 """
 
+import logging
 from typing import Callable, Tuple
 
 import torch
@@ -17,6 +18,7 @@ from nunchaku.caching.fbcache import cache_context, create_cache_context
 from nunchaku.lora.flux.compose import compose_lora
 from nunchaku.utils import load_state_dict_in_safetensors
 
+logger = logging.getLogger(__name__)
 
 class ComfyFluxWrapper(nn.Module):
     """
@@ -329,6 +331,115 @@ class ComfyFluxWrapper(nn.Module):
 
         self._prev_timestep = timestep_float
         return out
+
+    def reset_quantized_model(self):
+        """
+        Reset the C++ QuantizedFluxModel to free CUDA memory.
+        
+        This destroys the model state and frees ~857MB of CUDA allocations.
+        After calling this, reinit_quantized_model() must be called before
+        the model can be used again.
+        """
+        try:
+            if hasattr(self.model, 'transformer_blocks') and len(self.model.transformer_blocks) > 0:
+                block = self.model.transformer_blocks[0]
+                if hasattr(block, 'm'):
+                    quantized_model = block.m
+                    logger.info(f"Resetting C++ QuantizedFluxModel for model id={id(self.model)}")
+                    quantized_model.reset()
+                    
+                    # Trim memory after reset
+                    import torch
+                    from nunchaku._C import utils as cutils
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    cutils.trim_memory()
+                    logger.info("C++ model reset complete, CUDA memory freed")
+        except Exception as e:
+            logger.error(f"Failed to reset quantized model: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def reinit_quantized_model(self, use_fp4: bool = False, offload: bool = False, bf16: bool = True, attention_impl: str = "flashattn2"):
+        """
+        Reinitialize the C++ QuantizedFluxModel after it has been reset.
+        
+        This restores the model to a functional state by calling init(),
+        reloading weights, and setting the attention implementation.
+        
+        If the model is already initialized, this will skip reinitialization.
+        
+        Parameters
+        ----------
+        use_fp4 : bool, optional
+            Whether to use FP4 quantization (default: False).
+        offload : bool, optional
+            Whether to offload weights to CPU (default: False).
+        bf16 : bool, optional
+            Whether to use bfloat16 (default: True).
+        attention_impl : str, optional
+            Attention implementation: "flashattn2" or "nunchaku-fp16" (default: "flashattn2").
+        """
+        try:
+            if not hasattr(self.model, 'transformer_blocks') or len(self.model.transformer_blocks) == 0:
+                logger.error("No transformer blocks found in model")
+                return
+                
+            block = self.model.transformer_blocks[0]
+            if not hasattr(block, 'm'):
+                logger.error("No quantized model 'm' found in transformer block")
+                return
+                
+            quantized_model = block.m
+            
+            # Check if model is already initialized by trying to get some info
+            # If it's not initialized, this will fail or return invalid data
+            try:
+                # Try calling isBF16() to check if model is initialized
+                _ = quantized_model.isBF16()
+                logger.info("C++ model is already initialized, skipping reinit")
+                return
+            except Exception:
+                # Model is not initialized, proceed with reinit
+                pass
+            
+            if not hasattr(self.model, '_original_quantized_part_sd'):
+                logger.error("Model does not have _original_quantized_part_sd - cannot reinitialize")
+                logger.error("The model must be loaded with the updated loader that stores this state dict")
+                return
+            
+            # Get device ID from the block
+            device_id = 0
+            if hasattr(block, 'device'):
+                import torch
+                if isinstance(block.device, torch.device) and block.device.index is not None:
+                    device_id = block.device.index
+            
+            logger.info(f"Reinitializing C++ model on device {device_id} (use_fp4={use_fp4}, offload={offload}, bf16={bf16})")
+            
+            # Initialize the model
+            quantized_model.init(use_fp4, offload, bf16, device_id)
+            logger.info("Model initialized successfully")
+            
+            # Reload weights BEFORE setting attention impl
+            logger.info("Reloading weights from _original_quantized_part_sd...")
+            quantized_model.loadDict(self.model._original_quantized_part_sd, True)
+            logger.info("Weights reloaded successfully")
+            
+            # Set attention implementation (requires a callable, use dummy lambda)
+            try:
+                quantized_model.setAttentionImpl(attention_impl, lambda *args: None)
+                logger.info(f"Attention implementation set to {attention_impl}")
+            except Exception as e:
+                logger.warning(f"Failed to set attention impl: {e}")
+                
+            logger.info("C++ model reinitialization complete")
+            
+        except Exception as e:
+            logger.error(f"Failed to reinitialize quantized model: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def copy_with_ctx(model_wrapper: ComfyFluxWrapper) -> Tuple[ComfyFluxWrapper, ModelPatcher]:

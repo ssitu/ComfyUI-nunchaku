@@ -17,6 +17,7 @@ from nunchaku import NunchakuFluxTransformer2dModel
 from nunchaku.caching.diffusers_adapters.flux import apply_cache_on_transformer
 from nunchaku.utils import is_turing
 
+from ...model_patcher import NunchakuModelPatcher
 from ...wrappers.flux import ComfyFluxWrapper
 from ..utils import get_filename_list, get_full_path_or_raise
 
@@ -258,6 +259,63 @@ class NunchakuFluxDiTLoader:
                 torch_dtype=torch.float16 if data_type == "float16" else torch.bfloat16,
                 return_metadata=True,
             )
+            
+            # Store precision information for later reinit
+            # Check metadata for precision (fp4, int4, int8, etc.)
+            use_fp4 = False
+            if self.metadata and "quantization_config" in self.metadata:
+                import json
+                quant_config = json.loads(self.metadata["quantization_config"])
+                precision = quant_config.get("precision", "int4")
+                use_fp4 = (precision == "fp4")
+                self.transformer._use_fp4 = use_fp4
+                logger.info(f"Detected quantization precision: {precision}, use_fp4={use_fp4}")
+            else:
+                # Default to int4 (use_fp4=False)
+                self.transformer._use_fp4 = False
+                logger.info("No quantization config found, defaulting to use_fp4=False")
+            
+            # Store offload setting for later reinit
+            self.transformer._offload = cpu_offload_enabled
+            logger.info(f"Stored offload setting: {cpu_offload_enabled}")
+            
+            # Store the original quantized_part_sd for potential reset/reinit operations
+            # We need to reload the state dict from disk because _quantized_part_sd has meta tensors
+            if not hasattr(self.transformer, '_original_quantized_part_sd'):
+                try:
+                    from safetensors.torch import load_file
+                    from pathlib import Path
+                    import os
+                    
+                    model_path_obj = Path(model_path)
+                    if model_path_obj.is_file():
+                        # Single file model
+                        full_sd = load_file(model_path)
+                    else:
+                        # Directory with separate files
+                        # Try to find transformer_blocks file
+                        transformer_block_path = model_path_obj / "transformer_blocks.safetensors"
+                        if transformer_block_path.exists():
+                            full_sd = load_file(str(transformer_block_path))
+                        else:
+                            # Fallback: load from the main model file
+                            logger.warning("Could not find transformer_blocks.safetensors, skipping _original_quantized_part_sd storage")
+                            full_sd = {}
+                    
+                    # Extract only the quantized part (transformer_blocks and single_transformer_blocks)
+                    original_quantized_sd = {}
+                    for k, v in full_sd.items():
+                        if k.startswith(("transformer_blocks.", "single_transformer_blocks.")):
+                            original_quantized_sd[k] = v
+                    
+                    if original_quantized_sd:
+                        self.transformer._original_quantized_part_sd = original_quantized_sd
+                        logger.info(f"Stored _original_quantized_part_sd with {len(original_quantized_sd)} keys for potential reinit")
+                    else:
+                        logger.warning("No quantized part found in state dict, reset/reinit may not work")
+                except Exception as e:
+                    logger.warning(f"Failed to store _original_quantized_part_sd: {e}")
+            
             self.model_path = model_path
             self.device = device
             self.cpu_offload = cpu_offload_enabled
@@ -268,9 +326,16 @@ class NunchakuFluxDiTLoader:
         transformer = self.transformer
         if attention == "nunchaku-fp16":
             transformer.set_attention_impl("nunchaku-fp16")
+            attention_impl = "nunchaku-fp16"
         else:
             assert attention == "flash-attention2"
             transformer.set_attention_impl("flashattn2")
+            attention_impl = "flashattn2"
+        
+        # Store attention implementation setting for later reinit
+        if not hasattr(transformer, '_attention_impl'):
+            transformer._attention_impl = attention_impl
+            logger.info(f"Stored attention implementation: {attention_impl}")
 
         if self.metadata is None:
             if os.path.exists(os.path.join(model_path, "comfy_config.json")):
@@ -311,5 +376,11 @@ class NunchakuFluxDiTLoader:
                 "device_id": device_id,
             },
         )
-        model = comfy.model_patcher.ModelPatcher(model, device, device_id)
+        model = NunchakuModelPatcher(model, device, device_id)
+        
+        # Reset the C++ model immediately after loading to free CUDA memory
+        # It will be reinitialized automatically when needed for sampling
+        logger.info("Resetting C++ model after loading to free CUDA memory")
+        model.model.diffusion_model.reset_quantized_model()
+        
         return (model,)
