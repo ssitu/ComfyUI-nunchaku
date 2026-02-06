@@ -214,7 +214,7 @@ class ZImageModelPatcher(ModelPatcher):
                             if weight_key in self.patches:
                                 if force_patch_weights:
                                     self.patch_weight_to_device(weight_key)
-                                else:
+                                elif hasattr(m, "weight_function"):
                                     _, set_func, convert_func = get_key_weight(self.model, weight_key)
                                     m.weight_function.append(
                                         LowVramPatch(weight_key, self.patches, convert_func, set_func)
