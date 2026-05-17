@@ -3,17 +3,17 @@ This module provides the :class:`NunchakuZImageDiTLoader` class for loading Nunc
 """
 
 import json
+import logging
 
 import comfy.utils
 import torch
 from comfy import model_detection, model_management
 
-from nunchaku.models.linear import SVDQW4A4Linear
-from nunchaku.utils import check_hardware_compatibility, get_precision_from_quantization_config
+from nunchaku.models.transformers.utils import convert_fp16, patch_scale_key
+from nunchaku.utils import check_hardware_compatibility, get_precision_from_quantization_config, is_turing
 
 from ...model_configs.zimage import NunchakuZImage
-from comfy.model_patcher import ModelPatcher
-from ...wrappers.zimage import ComfyZImageWrapper
+from ...model_patcher.zimage import ZImageModelPatcher
 from ..utils import get_filename_list, get_full_path_or_raise
 
 
@@ -161,9 +161,6 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
     if len(temp_sd) > 0:
         sd = temp_sd
 
-    parameters = comfy.utils.calculate_parameters(sd)
-    weight_dtype = comfy.utils.weight_dtype(sd)
-
     load_device = model_management.get_torch_device()
     offload_device = model_management.unet_offload_device()
     check_hardware_compatibility(quantization_config, load_device)
@@ -172,43 +169,26 @@ def _load(sd: dict[str, torch.Tensor], metadata: dict[str, str] = {}):
 
     model_config = NunchakuZImage(rank=rank, precision=precision, skip_refiners=skip_refiners)
 
-    unet_weight_dtype = list(model_config.supported_inference_dtypes)
-
-    unet_dtype = model_management.unet_dtype(
-        model_params=parameters, supported_dtypes=unet_weight_dtype, weight_dtype=weight_dtype
-    )
-
-    manual_cast_dtype = model_management.unet_manual_cast(
-        unet_dtype, load_device, model_config.supported_inference_dtypes
-    )
+    if not is_turing():
+        unet_dtype = torch.bfloat16
+        manual_cast_dtype = None
+        torch_dtype = torch.bfloat16
+    else:
+        unet_dtype = torch.bfloat16
+        manual_cast_dtype = torch.float16
+        torch_dtype = torch.float16
+    logging.info(f"unet_dtype: {unet_dtype}, manual_cast_dtype: {manual_cast_dtype}, svdq_linear_dtype: {torch_dtype}")
+    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
 
     patched_sd = _patch_state_dict(new_sd)
+    model = model_config.get_model(patched_sd, "", torch_dtype=torch_dtype)
 
-    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
-    model = model_config.get_model(patched_sd, "")
-
-    _apply_nvfp4_scale_keys(model.diffusion_model, patched_sd)
+    patch_scale_key(model.diffusion_model, patched_sd)
+    if torch_dtype == torch.float16:
+        convert_fp16(model.diffusion_model, patched_sd)
 
     model.load_model_weights(patched_sd, "")
-
-    # Preserve the actual CUDA index when running multi-GPU.
-    device_id = load_device.index if isinstance(load_device, torch.device) and load_device.type == "cuda" else 0
-    if device_id is None:
-        device_id = 0
-
-    # Wrap in ComfyZImageWrapper for LoRA support
-    model.diffusion_model = ComfyZImageWrapper(
-        model.diffusion_model,
-        config=model_config.unet_config,
-        ctx_for_copy={
-            "model_config": model_config,
-            "device": load_device,
-            "device_id": device_id,
-            "offload_device": offload_device,
-        },
-    )
-
-    return ModelPatcher(model, load_device=load_device, offload_device=offload_device)
+    return ZImageModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
 
 class NunchakuZImageDiTLoader:
