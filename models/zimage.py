@@ -59,13 +59,37 @@ def fuse_to_svdquant_linear(comfy_linear1: nn.Linear, comfy_linear2: nn.Linear, 
     """
     assert comfy_linear1.in_features == comfy_linear2.in_features
     assert comfy_linear1.bias is None and comfy_linear2.bias is None
-    torch_dtype = kwargs.pop("torch_dtype", comfy_linear1.weight.dtype)
+
+    weight1 = getattr(comfy_linear1, "weight", None)
+    bias1 = getattr(comfy_linear1, "bias", None)
+
+    torch_dtype = kwargs.pop("torch_dtype", None)
+    if torch_dtype is None:
+        if weight1 is not None:
+            torch_dtype = weight1.dtype
+        else:
+            torch_dtype = getattr(comfy_linear1, "weight_comfy_model_dtype", None)
+    if torch_dtype is None:
+        if bias1 is not None:
+            torch_dtype = bias1.dtype
+        else:
+            torch_dtype = getattr(comfy_linear1, "bias_comfy_model_dtype", None)
+    if torch_dtype is None:
+        torch_dtype = torch.bfloat16
+
+    device = kwargs.pop("device", None)
+    if device is None:
+        if weight1 is not None:
+            device = weight1.device
+        elif bias1 is not None:
+            device = bias1.device
+
     svdq_linear = SVDQW4A4Linear(
         comfy_linear1.in_features,
         comfy_linear1.out_features + comfy_linear2.out_features,
         bias=False,
         torch_dtype=torch_dtype,
-        device=comfy_linear1.weight.device,
+        device=device,
         **kwargs,
     )
     add_comfy_cast_weights_attr(svdq_linear, comfy_linear1)
